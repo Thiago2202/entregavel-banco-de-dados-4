@@ -1,0 +1,171 @@
+-- =========================================================
+-- 07_testes_acesso.sql - Prova prática das permissões
+--
+-- Executa como superusuário/dono e assume cada identidade com SET ROLE.
+-- Linhas "ERROR: permission denied" são o resultado ESPERADO (acesso negado).
+-- As operações permitidas rodam dentro de BEGIN...ROLLBACK para não
+-- alterar os dados. (não use -v ON_ERROR_STOP=1 neste arquivo)
+-- =========================================================
+SET search_path TO express;
+SET
+-- =========================================================
+-- usr_analista (role_leitura)
+-- =========================================================
+SET ROLE usr_analista;
+SET
+SELECT current_user AS identidade;
+  identidade  
+--------------
+ usr_analista
+(1 linha)
+
+\echo '--- [OK esperado] consulta de relatorio sem dados pessoais'
+--- [OK esperado] consulta de relatorio sem dados pessoais
+SELECT c.cidade, count(*) AS pedidos, sum(p.valor_total) AS faturamento
+FROM table_comercio p JOIN table_clientes c ON c.id_cliente = p.id_cliente
+WHERE p.data_pedido >= now() - interval '30 days'
+GROUP BY c.cidade ORDER BY faturamento DESC LIMIT 3;
+     cidade     | pedidos | faturamento 
+----------------+---------+-------------
+ Londrina       |    3100 |   727441.40
+ Ribeirão Preto |    3100 |   726742.95
+ Curitiba       |    3096 |   726250.60
+(3 linhas)
+
+\echo '--- [NEGADO esperado] ler CPF/CNPJ (coluna sensivel)'
+--- [NEGADO esperado] ler CPF/CNPJ (coluna sensivel)
+SELECT cpf_cnpj FROM table_clientes LIMIT 1;
+psql:sql/07_testes_acesso.sql:25: ERROR:  permission denied for table table_clientes
+\echo '--- [NEGADO esperado] SELECT * inclui colunas sensiveis'
+--- [NEGADO esperado] SELECT * inclui colunas sensiveis
+SELECT * FROM table_clientes LIMIT 1;
+psql:sql/07_testes_acesso.sql:28: ERROR:  permission denied for table table_clientes
+\echo '--- [NEGADO esperado] INSERT / UPDATE / DELETE'
+--- [NEGADO esperado] INSERT / UPDATE / DELETE
+INSERT INTO table_bebidas (nome, categoria) VALUES ('Teste', 'Teste');
+psql:sql/07_testes_acesso.sql:31: ERROR:  permission denied for table table_bebidas
+UPDATE table_valor SET preco_venda = 0.01;
+psql:sql/07_testes_acesso.sql:32: ERROR:  permission denied for table table_valor
+DELETE FROM table_comercio;
+psql:sql/07_testes_acesso.sql:33: ERROR:  permission denied for table table_comercio
+RESET ROLE;
+RESET
+-- =========================================================
+-- usr_vendedor (role_operacao)
+-- =========================================================
+SET ROLE usr_vendedor;
+SET
+SELECT current_user AS identidade;
+  identidade  
+--------------
+ usr_vendedor
+(1 linha)
+
+\echo '--- [OK esperado] cadastra cliente, lanca pedido e baixa estoque (depois ROLLBACK)'
+--- [OK esperado] cadastra cliente, lanca pedido e baixa estoque (depois ROLLBACK)
+BEGIN;
+BEGIN
+INSERT INTO table_clientes (nome, tipo_pessoa, cpf_cnpj, cidade, estado)
+VALUES ('Teste Vendedor', 'Fisica', '11122233344', 'Campinas', 'SP')
+RETURNING id_cliente AS id_cliente_teste \gset
+INSERT 0 1
+INSERT INTO table_comercio (id_cliente, id_bebida, id_valor, quantidade, valor_total, forma_pagamento)
+SELECT :id_cliente_teste, id_bebida, id_valor, 2, 2 * preco_venda, 'Pix'
+FROM table_valor WHERE ativo AND data_vigencia_fim IS NULL ORDER BY id_bebida LIMIT 1
+RETURNING id_pedido, valor_total;
+ id_pedido | valor_total 
+-----------+-------------
+    300006 |       22.90
+(1 linha)
+
+INSERT 0 1
+UPDATE table_bebidas SET estoque_atual = estoque_atual - 2 WHERE id_bebida = 1
+RETURNING id_bebida, estoque_atual;
+ id_bebida | estoque_atual 
+-----------+---------------
+         1 |           363
+(1 linha)
+
+UPDATE 1
+UPDATE table_comercio SET status_entrega = 'Em rota' WHERE id_pedido = 1 AND FALSE;  -- coluna permitida
+UPDATE 0
+ROLLBACK;
+ROLLBACK
+\echo '--- [NEGADO esperado] alterar preco'
+--- [NEGADO esperado] alterar preco
+UPDATE table_valor SET preco_venda = 0.01 WHERE id_valor = 1;
+psql:sql/07_testes_acesso.sql:58: ERROR:  permission denied for table table_valor
+\echo '--- [NEGADO esperado] alterar CPF de cliente (coluna fora do UPDATE permitido)'
+--- [NEGADO esperado] alterar CPF de cliente (coluna fora do UPDATE permitido)
+UPDATE table_clientes SET cpf_cnpj = '00000000000' WHERE id_cliente = 1;
+psql:sql/07_testes_acesso.sql:61: ERROR:  permission denied for table table_clientes
+\echo '--- [NEGADO esperado] alterar quantidade/valor de pedido ja lancado'
+--- [NEGADO esperado] alterar quantidade/valor de pedido ja lancado
+UPDATE table_comercio SET valor_total = 0 WHERE id_pedido = 1;
+psql:sql/07_testes_acesso.sql:64: ERROR:  permission denied for table table_comercio
+\echo '--- [NEGADO esperado] DELETE e TRUNCATE'
+--- [NEGADO esperado] DELETE e TRUNCATE
+DELETE FROM table_comercio WHERE id_pedido = 1;
+psql:sql/07_testes_acesso.sql:67: ERROR:  permission denied for table table_comercio
+TRUNCATE table_comercio;
+psql:sql/07_testes_acesso.sql:68: ERROR:  permission denied for table table_comercio
+\echo '--- [NEGADO esperado] DDL (criar tabela / alterar estrutura)'
+--- [NEGADO esperado] DDL (criar tabela / alterar estrutura)
+CREATE TABLE table_intrusa (id int);
+psql:sql/07_testes_acesso.sql:71: ERROR:  permission denied for schema express
+LINHA 1: CREATE TABLE table_intrusa (id int);
+                      ^
+ALTER TABLE table_bebidas ADD COLUMN x int;
+psql:sql/07_testes_acesso.sql:72: ERROR:  must be owner of table table_bebidas
+RESET ROLE;
+RESET
+-- =========================================================
+-- REVOKE / GRANT em ação: retirar e devolver permissão em tempo real
+-- =========================================================
+\echo
+
+\echo '=== REVOKE de coluna: vendedor perde a baixa de estoque ==='
+=== REVOKE de coluna: vendedor perde a baixa de estoque ===
+REVOKE UPDATE (estoque_atual) ON table_bebidas FROM role_operacao;
+REVOKE
+SET ROLE usr_vendedor;
+SET
+UPDATE table_bebidas SET estoque_atual = estoque_atual - 1 WHERE id_bebida = 1;   -- agora negado
+psql:sql/07_testes_acesso.sql:84: ERROR:  permission denied for table table_bebidas
+RESET ROLE;
+RESET
+\echo '=== GRANT: permissao devolvida ==='
+=== GRANT: permissao devolvida ===
+GRANT UPDATE (estoque_atual) ON table_bebidas TO role_operacao;
+GRANT
+SET ROLE usr_vendedor;
+SET
+BEGIN;
+BEGIN
+UPDATE table_bebidas SET estoque_atual = estoque_atual - 1 WHERE id_bebida = 1 RETURNING id_bebida, estoque_atual;
+ id_bebida | estoque_atual 
+-----------+---------------
+         1 |           364
+(1 linha)
+
+UPDATE 1
+ROLLBACK;
+ROLLBACK
+RESET ROLE;
+RESET
+\echo
+
+\echo '=== REVOKE de role: usuario desligado da equipe de operacao ==='
+=== REVOKE de role: usuario desligado da equipe de operacao ===
+REVOKE role_operacao FROM usr_vendedor;
+REVOKE ROLE
+SET ROLE usr_vendedor;
+SET
+SELECT count(*) FROM express.table_comercio;   -- negado: sem role, sem acesso ao schema
+psql:sql/07_testes_acesso.sql:100: ERROR:  permission denied for schema express
+LINHA 1: SELECT count(*) FROM express.table_comercio;
+                              ^
+RESET ROLE;
+RESET
+GRANT role_operacao TO usr_vendedor;       -- restaura
+GRANT ROLE

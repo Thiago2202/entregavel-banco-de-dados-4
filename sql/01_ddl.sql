@@ -1,0 +1,155 @@
+-- =========================================================
+-- Sistema_Express - Distribuição de Bebidas
+-- 01_ddl.sql - Modelagem FÍSICA (PostgreSQL 14+)
+--
+-- Implementa o modelo lógico da Sprint 3 (Sistema_Express.sql)
+-- com tipos nativos do PostgreSQL e restrições de integridade.
+-- O script é re-executável: recria o schema do zero.
+-- =========================================================
+
+DROP SCHEMA IF EXISTS express CASCADE;
+CREATE SCHEMA express;
+COMMENT ON SCHEMA express IS 'Sistema_Express - distribuição de bebidas';
+
+SET search_path TO express;
+
+-- ---------------------------------------------------------
+-- 1. table_bebidas - catálogo de produtos
+-- ---------------------------------------------------------
+CREATE TABLE table_bebidas (
+    id_bebida       SERIAL       PRIMARY KEY,
+    nome            TEXT         NOT NULL,
+    categoria       TEXT         NOT NULL,          -- Refrigerante, Cerveja, Água, Suco, Energético...
+    marca           TEXT,
+    embalagem       TEXT,                           -- Lata, Garrafa PET, Garrafa de Vidro, Fardo
+    volume_ml       INTEGER,
+    estoque_atual   INTEGER      NOT NULL DEFAULT 0,
+    estoque_minimo  INTEGER      NOT NULL DEFAULT 0,
+    ativo           BOOLEAN      NOT NULL DEFAULT TRUE,
+    data_cadastro   TIMESTAMPTZ  NOT NULL DEFAULT now(),
+
+    CONSTRAINT ck_bebidas_nome        CHECK (char_length(btrim(nome)) BETWEEN 1 AND 100),
+    CONSTRAINT ck_bebidas_categoria   CHECK (char_length(btrim(categoria)) BETWEEN 1 AND 50),
+    CONSTRAINT ck_bebidas_volume      CHECK (volume_ml IS NULL OR volume_ml > 0),
+    -- Estoque nunca negativo: impede vender mais do que existe.
+    CONSTRAINT ck_bebidas_estoque     CHECK (estoque_atual >= 0),
+    CONSTRAINT ck_bebidas_est_minimo  CHECK (estoque_minimo >= 0)
+);
+
+-- ---------------------------------------------------------
+-- 2. table_clientes - cadastro de clientes
+--    cpf_cnpj é guardado SOMENTE com dígitos (máscara é
+--    responsabilidade da aplicação), o que permite UNIQUE
+--    confiável e CHECK de tamanho.
+-- ---------------------------------------------------------
+CREATE TABLE table_clientes (
+    id_cliente      SERIAL       PRIMARY KEY,
+    nome            TEXT         NOT NULL,
+    tipo_pessoa     TEXT         NOT NULL DEFAULT 'Fisica',
+    cpf_cnpj        TEXT         NOT NULL,
+    telefone        TEXT,
+    email           TEXT,
+    endereco        TEXT,
+    numero          TEXT,
+    bairro          TEXT,
+    cidade          TEXT,
+    estado          CHAR(2),
+    cep             CHAR(8),
+    ativo           BOOLEAN      NOT NULL DEFAULT TRUE,
+    data_cadastro   TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    abastecido_mes  BOOLEAN      NOT NULL DEFAULT FALSE,  -- já recebeu entrega no mês corrente?
+
+    CONSTRAINT uq_clientes_cpf_cnpj   UNIQUE (cpf_cnpj),
+    CONSTRAINT ck_clientes_nome       CHECK (char_length(btrim(nome)) BETWEEN 1 AND 150),
+    CONSTRAINT ck_clientes_tipo       CHECK (tipo_pessoa IN ('Fisica', 'Juridica')),
+    -- CPF = 11 dígitos (Física) | CNPJ = 14 dígitos (Jurídica)
+    CONSTRAINT ck_clientes_documento  CHECK (
+           (tipo_pessoa = 'Fisica'   AND cpf_cnpj ~ '^[0-9]{11}$')
+        OR (tipo_pessoa = 'Juridica' AND cpf_cnpj ~ '^[0-9]{14}$')),
+    CONSTRAINT ck_clientes_telefone   CHECK (telefone IS NULL OR telefone ~ '^[0-9]{10,11}$'),
+    CONSTRAINT ck_clientes_email      CHECK (email IS NULL OR email ~* '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'),
+    CONSTRAINT ck_clientes_estado     CHECK (estado IS NULL OR estado ~ '^[A-Z]{2}$'),
+    CONSTRAINT ck_clientes_cep        CHECK (cep IS NULL OR cep ~ '^[0-9]{8}$')
+);
+
+-- ---------------------------------------------------------
+-- 3. table_valor - histórico de preços das bebidas
+--    Cada linha é uma "vigência" de preço. A vigência atual
+--    é a que tem data_vigencia_fim NULL e ativo = TRUE.
+-- ---------------------------------------------------------
+CREATE TABLE table_valor (
+    id_valor              SERIAL         PRIMARY KEY,
+    id_bebida             INTEGER        NOT NULL,
+    preco_custo           NUMERIC(10,2)  NOT NULL,
+    preco_venda           NUMERIC(10,2)  NOT NULL,
+    data_vigencia_inicio  DATE           NOT NULL DEFAULT CURRENT_DATE,
+    data_vigencia_fim     DATE,
+    ativo                 BOOLEAN        NOT NULL DEFAULT TRUE,
+
+    CONSTRAINT fk_valor_bebida FOREIGN KEY (id_bebida)
+        REFERENCES table_bebidas (id_bebida)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+    CONSTRAINT ck_valor_custo    CHECK (preco_custo >= 0),
+    CONSTRAINT ck_valor_venda    CHECK (preco_venda > 0),
+    CONSTRAINT ck_valor_vigencia CHECK (data_vigencia_fim IS NULL
+                                        OR data_vigencia_fim >= data_vigencia_inicio),
+    -- Mesma bebida não pode ter duas vigências começando no mesmo dia.
+    CONSTRAINT uq_valor_bebida_inicio UNIQUE (id_bebida, data_vigencia_inicio),
+    -- Alvo da FK composta de table_comercio (garante que preço e bebida "combinam").
+    CONSTRAINT uq_valor_id_bebida     UNIQUE (id_valor, id_bebida)
+);
+
+-- ---------------------------------------------------------
+-- 4. table_comercio - pedidos / vendas
+--    Uma linha = uma bebida vendida a um cliente (modelo da Sprint 3).
+--    valor_total é gravado (preço x quantidade NO MOMENTO da venda),
+--    pois o preço da bebida pode mudar depois.
+-- ---------------------------------------------------------
+CREATE TABLE table_comercio (
+    id_pedido        SERIAL         PRIMARY KEY,
+    id_cliente       INTEGER        NOT NULL,
+    id_bebida        INTEGER        NOT NULL,
+    id_valor         INTEGER        NOT NULL,          -- preço aplicado no momento da venda
+    quantidade       INTEGER        NOT NULL,
+    valor_total      NUMERIC(12,2)  NOT NULL,
+    forma_pagamento  TEXT,
+    status_entrega   TEXT           NOT NULL DEFAULT 'Pendente',
+    data_pedido      TIMESTAMPTZ    NOT NULL DEFAULT now(),
+    data_entrega     TIMESTAMPTZ,
+
+    CONSTRAINT fk_comercio_cliente FOREIGN KEY (id_cliente)
+        REFERENCES table_clientes (id_cliente)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_comercio_bebida FOREIGN KEY (id_bebida)
+        REFERENCES table_bebidas (id_bebida)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT,
+    -- FK composta: o id_valor informado TEM que pertencer ao id_bebida informado.
+    -- (o modelo lógico permitia pedido da bebida A com o preço da bebida B).
+    CONSTRAINT fk_comercio_valor FOREIGN KEY (id_valor, id_bebida)
+        REFERENCES table_valor (id_valor, id_bebida)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT,
+
+    CONSTRAINT ck_comercio_quantidade CHECK (quantidade > 0),
+    CONSTRAINT ck_comercio_total      CHECK (valor_total >= 0),
+    CONSTRAINT ck_comercio_pagamento  CHECK (forma_pagamento IS NULL
+                                             OR forma_pagamento IN ('Dinheiro', 'Pix', 'Cartao', 'Boleto')),
+    CONSTRAINT ck_comercio_status     CHECK (status_entrega IN ('Pendente', 'Em rota', 'Entregue', 'Cancelado')),
+    -- data_entrega só existe (e é obrigatória) quando o pedido foi Entregue.
+    CONSTRAINT ck_comercio_entrega    CHECK ((status_entrega = 'Entregue') = (data_entrega IS NOT NULL)),
+    CONSTRAINT ck_comercio_datas      CHECK (data_entrega IS NULL OR data_entrega >= data_pedido)
+);
+
+-- ---------------------------------------------------------
+-- Documentação no próprio catálogo (visível no \d+ e no DBeaver)
+-- ---------------------------------------------------------
+COMMENT ON TABLE  table_bebidas  IS 'Catálogo de bebidas e controle de estoque';
+COMMENT ON TABLE  table_clientes IS 'Clientes (PF/PJ) atendidos pela distribuidora';
+COMMENT ON TABLE  table_valor    IS 'Histórico de preços por bebida (uma linha por vigência)';
+COMMENT ON TABLE  table_comercio IS 'Pedidos/vendas: cliente x bebida x preço aplicado';
+COMMENT ON COLUMN table_clientes.cpf_cnpj      IS 'Somente dígitos: 11 (CPF) ou 14 (CNPJ)';
+COMMENT ON COLUMN table_comercio.valor_total   IS 'quantidade x preco_venda da vigência usada, congelado na venda';
+COMMENT ON COLUMN table_valor.data_vigencia_fim IS 'NULL = vigência em aberto (preço atual)';

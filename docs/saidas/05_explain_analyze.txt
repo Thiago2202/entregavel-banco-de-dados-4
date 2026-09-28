@@ -1,0 +1,396 @@
+-- =========================================================
+-- 05_explain_analyze.sql - O PostgreSQL usa mesmo os índices?
+--
+-- EXPLAIN ANALYZE EXECUTA a consulta de verdade e mostra o plano real
+-- (tempo, linhas, buffers). BUFFERS mostra quantas páginas de 8 kB foram
+-- lidas (shared hit = cache, read = disco).
+--
+-- Cada consulta roda duas vezes: COM o índice e SEM ele. Como o DDL do
+-- PostgreSQL é transacional, o "sem índice" é feito assim:
+--     BEGIN; DROP INDEX ...; EXPLAIN ANALYZE ...; ROLLBACK;
+-- e o índice volta intacto após o ROLLBACK.
+-- =========================================================
+SET search_path TO express;
+SET
+VACUUM (ANALYZE) table_bebidas, table_clientes, table_valor, table_comercio;  -- estatísticas e resumos BRIN frescos (a etapa 04 alterou dados)
+VACUUM
+-- ---------------------------------------------------------
+-- Q1 - Últimos 10 pedidos de um cliente (tela de atendimento)
+--      Índice esperado: idx_comercio_cliente_data (id_cliente, data_pedido DESC)
+-- ---------------------------------------------------------
+\echo
+
+\echo '##### Q1 COM indice #####'
+##### Q1 COM indice #####
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT p.id_pedido, p.data_pedido, b.nome, p.quantidade, p.valor_total, p.status_entrega
+FROM table_comercio p
+JOIN table_bebidas  b ON b.id_bebida = p.id_bebida
+WHERE p.id_cliente = 4321
+ORDER BY p.data_pedido DESC
+LIMIT 10;
+                                                                         QUERY PLAN                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.57..66.30 rows=10 width=53) (actual time=0.010..0.027 rows=10 loops=1)
+   Buffers: shared hit=33
+   ->  Nested Loop  (cost=0.57..99.17 rows=15 width=53) (actual time=0.009..0.026 rows=10 loops=1)
+         Buffers: shared hit=33
+         ->  Index Scan using idx_comercio_cliente_data on table_comercio p  (cost=0.42..64.68 rows=15 width=35) (actual time=0.006..0.014 rows=10 loops=1)
+               Index Cond: (id_cliente = 4321)
+               Buffers: shared hit=13
+         ->  Index Scan using table_bebidas_pkey on table_bebidas b  (cost=0.15..2.30 rows=1 width=26) (actual time=0.001..0.001 rows=1 loops=10)
+               Index Cond: (id_bebida = p.id_bebida)
+               Buffers: shared hit=20
+ Planning:
+   Buffers: shared hit=156
+ Planning Time: 0.333 ms
+ Execution Time: 0.038 ms
+(14 linhas)
+
+\echo
+
+\echo '##### Q1 SEM indice (DROP INDEX dentro de transacao + ROLLBACK) #####'
+##### Q1 SEM indice (DROP INDEX dentro de transacao + ROLLBACK) #####
+BEGIN;
+BEGIN
+DROP INDEX idx_comercio_cliente_data;
+DROP INDEX
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT p.id_pedido, p.data_pedido, b.nome, p.quantidade, p.valor_total, p.status_entrega
+FROM table_comercio p
+JOIN table_bebidas  b ON b.id_bebida = p.id_bebida
+WHERE p.id_cliente = 4321
+ORDER BY p.data_pedido DESC
+LIMIT 10;
+                                                                          QUERY PLAN                                                                          
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=5903.42..5904.58 rows=10 width=53) (actual time=7.650..9.616 rows=10 loops=1)
+   Buffers: shared hit=3367
+   ->  Gather Merge  (cost=5903.42..5904.82 rows=12 width=53) (actual time=7.649..9.614 rows=10 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=3367
+         ->  Sort  (cost=4903.39..4903.41 rows=6 width=53) (actual time=4.705..4.706 rows=3 loops=3)
+               Sort Key: p.data_pedido DESC
+               Sort Method: quicksort  Memory: 25kB
+               Buffers: shared hit=3367
+               Worker 0:  Sort Method: quicksort  Memory: 25kB
+               Worker 1:  Sort Method: quicksort  Memory: 25kB
+               ->  Nested Loop  (cost=0.15..4903.32 rows=6 width=53) (actual time=1.346..4.685 rows=4 loops=3)
+                     Buffers: shared hit=3351
+                     ->  Parallel Seq Scan on table_comercio p  (cost=0.00..4889.52 rows=6 width=35) (actual time=1.334..4.666 rows=4 loops=3)
+                           Filter: (id_cliente = 4321)
+                           Rows Removed by Filter: 99997
+                           Buffers: shared hit=3327
+                     ->  Index Scan using table_bebidas_pkey on table_bebidas b  (cost=0.15..2.30 rows=1 width=26) (actual time=0.004..0.004 rows=1 loops=11)
+                           Index Cond: (id_bebida = p.id_bebida)
+                           Buffers: shared hit=24
+ Planning:
+   Buffers: shared hit=22
+ Planning Time: 0.117 ms
+ Execution Time: 9.631 ms
+(25 linhas)
+
+ROLLBACK;
+ROLLBACK
+-- ---------------------------------------------------------
+-- Q2 - Fila de entregas em aberto, mais antigas primeiro (roteirização)
+--      Índice esperado: idx_comercio_em_aberto (parcial)
+-- ---------------------------------------------------------
+\echo
+
+\echo '##### Q2 COM indice parcial #####'
+##### Q2 COM indice parcial #####
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id_pedido, id_cliente, status_entrega, data_pedido
+FROM table_comercio
+WHERE status_entrega IN ('Pendente', 'Em rota')
+ORDER BY data_pedido;
+                                                                   QUERY PLAN                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using idx_comercio_em_aberto on table_comercio  (cost=0.28..106.38 rows=2540 width=25) (actual time=0.007..0.384 rows=2395 loops=1)
+   Buffers: shared hit=37
+ Planning:
+   Buffers: shared hit=31
+ Planning Time: 0.150 ms
+ Execution Time: 0.453 ms
+(6 linhas)
+
+\echo
+
+\echo '##### Q2 SEM indice parcial #####'
+##### Q2 SEM indice parcial #####
+BEGIN;
+BEGIN
+DROP INDEX idx_comercio_em_aberto;
+DROP INDEX
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id_pedido, id_cliente, status_entrega, data_pedido
+FROM table_comercio
+WHERE status_entrega IN ('Pendente', 'Em rota')
+ORDER BY data_pedido;
+                                                              QUERY PLAN                                                              
+--------------------------------------------------------------------------------------------------------------------------------------
+ Gather Merge  (cost=5942.69..6189.57 rows=2116 width=25) (actual time=11.705..13.897 rows=2395 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=3401
+   ->  Sort  (cost=4942.66..4945.31 rows=1058 width=25) (actual time=9.428..9.454 rows=798 loops=3)
+         Sort Key: data_pedido
+         Sort Method: quicksort  Memory: 67kB
+         Buffers: shared hit=3401
+         Worker 0:  Sort Method: quicksort  Memory: 63kB
+         Worker 1:  Sort Method: quicksort  Memory: 49kB
+         ->  Parallel Seq Scan on table_comercio  (cost=0.00..4889.52 rows=1058 width=25) (actual time=9.147..9.290 rows=798 loops=3)
+               Filter: (status_entrega = ANY ('{Pendente,"Em rota"}'::text[]))
+               Rows Removed by Filter: 99203
+               Buffers: shared hit=3327
+ Planning:
+   Buffers: shared hit=5
+ Planning Time: 0.035 ms
+ Execution Time: 13.973 ms
+(18 linhas)
+
+ROLLBACK;
+ROLLBACK
+-- ---------------------------------------------------------
+-- Q3 - Faturamento por dia dos últimos 7 dias (relatório por período)
+--      Índice esperado: idx_comercio_data_brin (BRIN)
+-- ---------------------------------------------------------
+\echo
+
+\echo '##### Q3 COM BRIN #####'
+##### Q3 COM BRIN #####
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT date_trunc('day', data_pedido) AS dia, count(*) AS pedidos, sum(valor_total) AS faturamento
+FROM table_comercio
+WHERE data_pedido >= now() - interval '7 days'
+GROUP BY 1
+ORDER BY 1;
+                                                                    QUERY PLAN                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ GroupAggregate  (cost=3924.33..4071.01 rows=5867 width=48) (actual time=2.764..3.374 rows=8 loops=1)
+   Group Key: (date_trunc('day'::text, data_pedido))
+   Buffers: shared hit=132
+   ->  Sort  (cost=3924.33..3939.00 rows=5867 width=14) (actual time=2.701..2.862 rows=5757 loops=1)
+         Sort Key: (date_trunc('day'::text, data_pedido))
+         Sort Method: quicksort  Memory: 372kB
+         Buffers: shared hit=132
+         ->  Bitmap Heap Scan on table_comercio  (cost=13.50..3557.10 rows=5867 width=14) (actual time=0.952..2.316 rows=5757 loops=1)
+               Recheck Cond: (data_pedido >= (now() - '7 days'::interval))
+               Rows Removed by Index Recheck: 5681
+               Heap Blocks: lossy=127
+               Buffers: shared hit=132
+               ->  Bitmap Index Scan on idx_comercio_data_brin  (cost=0.00..12.04 rows=11539 width=0) (actual time=0.023..0.024 rows=1270 loops=1)
+                     Index Cond: (data_pedido >= (now() - '7 days'::interval))
+                     Buffers: shared hit=5
+ Planning:
+   Buffers: shared hit=51
+ Planning Time: 0.181 ms
+ Execution Time: 3.401 ms
+(19 linhas)
+
+\echo
+
+\echo '##### Q3 SEM BRIN #####'
+##### Q3 SEM BRIN #####
+BEGIN;
+BEGIN
+DROP INDEX idx_comercio_data_brin;
+DROP INDEX
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT date_trunc('day', data_pedido) AS dia, count(*) AS pedidos, sum(valor_total) AS faturamento
+FROM table_comercio
+WHERE data_pedido >= now() - interval '7 days'
+GROUP BY 1
+ORDER BY 1;
+                                                                     QUERY PLAN                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate  (cost=6658.26..7420.72 rows=5867 width=48) (actual time=15.560..17.853 rows=8 loops=1)
+   Group Key: (date_trunc('day'::text, data_pedido))
+   Buffers: shared hit=3401
+   ->  Gather Merge  (cost=6658.26..7283.81 rows=4890 width=48) (actual time=15.499..17.837 rows=24 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=3401
+         ->  Partial GroupAggregate  (cost=5658.23..5719.36 rows=2445 width=48) (actual time=13.471..13.689 rows=8 loops=3)
+               Group Key: (date_trunc('day'::text, data_pedido))
+               Buffers: shared hit=3401
+               ->  Sort  (cost=5658.23..5664.35 rows=2445 width=14) (actual time=13.443..13.502 rows=1919 loops=3)
+                     Sort Key: (date_trunc('day'::text, data_pedido))
+                     Sort Method: quicksort  Memory: 164kB
+                     Buffers: shared hit=3401
+                     Worker 0:  Sort Method: quicksort  Memory: 105kB
+                     Worker 1:  Sort Method: quicksort  Memory: 105kB
+                     ->  Parallel Seq Scan on table_comercio  (cost=0.00..5520.63 rows=2445 width=14) (actual time=12.745..13.239 rows=1919 loops=3)
+                           Filter: (data_pedido >= (now() - '7 days'::interval))
+                           Rows Removed by Filter: 98082
+                           Buffers: shared hit=3327
+ Planning:
+   Buffers: shared hit=5
+ Planning Time: 0.054 ms
+ Execution Time: 17.870 ms
+(24 linhas)
+
+ROLLBACK;
+ROLLBACK
+-- ---------------------------------------------------------
+-- Q4 - Clientes ativos de um bairro (roteirização por região)
+--      Índice esperado: idx_clientes_cidade_bairro (parcial: WHERE ativo)
+-- ---------------------------------------------------------
+\echo
+
+\echo '##### Q4 COM indice #####'
+##### Q4 COM indice #####
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id_cliente, nome, telefone
+FROM table_clientes
+WHERE ativo AND cidade = 'Campinas' AND bairro = 'Bairro 07';
+                                                             QUERY PLAN                                                              
+-------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on table_clientes  (cost=5.26..237.65 rows=95 width=30) (actual time=0.021..0.096 rows=95 loops=1)
+   Recheck Cond: ((cidade = 'Campinas'::text) AND (bairro = 'Bairro 07'::text) AND ativo)
+   Heap Blocks: exact=95
+   Buffers: shared hit=97
+   ->  Bitmap Index Scan on idx_clientes_cidade_bairro  (cost=0.00..5.24 rows=95 width=0) (actual time=0.009..0.009 rows=95 loops=1)
+         Index Cond: ((cidade = 'Campinas'::text) AND (bairro = 'Bairro 07'::text))
+         Buffers: shared hit=2
+ Planning:
+   Buffers: shared hit=53
+ Planning Time: 0.146 ms
+ Execution Time: 0.107 ms
+(11 linhas)
+
+\echo
+
+\echo '##### Q4 SEM indice #####'
+##### Q4 SEM indice #####
+BEGIN;
+BEGIN
+DROP INDEX idx_clientes_cidade_bairro;
+DROP INDEX
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id_cliente, nome, telefone
+FROM table_clientes
+WHERE ativo AND cidade = 'Campinas' AND bairro = 'Bairro 07';
+                                                 QUERY PLAN                                                  
+-------------------------------------------------------------------------------------------------------------
+ Seq Scan on table_clientes  (cost=0.00..748.03 rows=95 width=30) (actual time=0.007..1.939 rows=95 loops=1)
+   Filter: (ativo AND (cidade = 'Campinas'::text) AND (bairro = 'Bairro 07'::text))
+   Rows Removed by Filter: 19907
+   Buffers: shared hit=448
+ Planning:
+   Buffers: shared hit=6
+ Planning Time: 0.036 ms
+ Execution Time: 1.948 ms
+(8 linhas)
+
+ROLLBACK;
+ROLLBACK
+-- ---------------------------------------------------------
+-- Q5 - Total vendido de uma bebida (FK id_bebida)
+--      Índice esperado: idx_comercio_bebida
+-- ---------------------------------------------------------
+\echo
+
+\echo '##### Q5 COM indice #####'
+##### Q5 COM indice #####
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) AS pedidos, sum(quantidade) AS unidades, sum(valor_total) AS faturamento
+FROM table_comercio
+WHERE id_bebida = 42;
+                                                              QUERY PLAN                                                               
+---------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=1812.99..1813.00 rows=1 width=48) (actual time=0.746..0.746 rows=1 loops=1)
+   Buffers: shared hit=677
+   ->  Bitmap Heap Scan on table_comercio  (cost=14.09..1807.38 rows=748 width=10) (actual time=0.102..0.671 rows=767 loops=1)
+         Recheck Cond: (id_bebida = 42)
+         Heap Blocks: exact=675
+         Buffers: shared hit=677
+         ->  Bitmap Index Scan on idx_comercio_bebida  (cost=0.00..13.91 rows=748 width=0) (actual time=0.047..0.047 rows=767 loops=1)
+               Index Cond: (id_bebida = 42)
+               Buffers: shared hit=2
+ Planning:
+   Buffers: shared hit=19
+ Planning Time: 0.070 ms
+ Execution Time: 0.758 ms
+(13 linhas)
+
+\echo
+
+\echo '##### Q5 SEM indice #####'
+##### Q5 SEM indice #####
+BEGIN;
+BEGIN
+DROP INDEX idx_comercio_bebida;
+DROP INDEX
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) AS pedidos, sum(quantidade) AS unidades, sum(valor_total) AS faturamento
+FROM table_comercio
+WHERE id_bebida = 42;
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=5892.09..5892.10 rows=1 width=48) (actual time=7.073..9.113 rows=1 loops=1)
+   Buffers: shared hit=3327
+   ->  Gather  (cost=5891.86..5892.07 rows=2 width=48) (actual time=7.012..9.106 rows=3 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=3327
+         ->  Partial Aggregate  (cost=4891.86..4891.87 rows=1 width=48) (actual time=4.805..4.806 rows=1 loops=3)
+               Buffers: shared hit=3327
+               ->  Parallel Seq Scan on table_comercio  (cost=0.00..4889.52 rows=312 width=10) (actual time=0.008..4.772 rows=256 loops=3)
+                     Filter: (id_bebida = 42)
+                     Rows Removed by Filter: 99745
+                     Buffers: shared hit=3327
+ Planning:
+   Buffers: shared hit=5
+ Planning Time: 0.043 ms
+ Execution Time: 9.142 ms
+(16 linhas)
+
+ROLLBACK;
+ROLLBACK
+-- ---------------------------------------------------------
+-- Q6 - Contra-exemplo: tabela pequena. Filtrar bebidas por categoria.
+--      Não há índice em table_bebidas.categoria de propósito: com 400 linhas
+--      o Seq Scan é o plano ótimo (a tabela cabe em ~6 páginas).
+-- ---------------------------------------------------------
+\echo
+
+\echo '##### Q6 (sem indice, por decisao de projeto) #####'
+##### Q6 (sem indice, por decisao de projeto) #####
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id_bebida, nome, estoque_atual
+FROM table_bebidas
+WHERE categoria = 'Cerveja' AND ativo AND estoque_atual <= estoque_minimo;
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Seq Scan on table_bebidas  (cost=0.00..12.02 rows=22 width=30) (actual time=0.011..0.026 rows=4 loops=1)
+   Filter: (ativo AND (estoque_atual <= estoque_minimo) AND (categoria = 'Cerveja'::text))
+   Rows Removed by Filter: 397
+   Buffers: shared hit=6
+ Planning:
+   Buffers: shared hit=18
+ Planning Time: 0.058 ms
+ Execution Time: 0.031 ms
+(8 linhas)
+
+-- Conferência: os índices continuam todos no lugar após os ROLLBACKs
+SELECT indexname FROM pg_indexes WHERE schemaname = 'express' ORDER BY tablename, indexname;
+         indexname          
+----------------------------
+ table_bebidas_pkey
+ idx_clientes_cidade_bairro
+ table_clientes_pkey
+ uq_clientes_cpf_cnpj
+ idx_comercio_bebida
+ idx_comercio_cliente_data
+ idx_comercio_data_brin
+ idx_comercio_em_aberto
+ table_comercio_pkey
+ table_valor_pkey
+ uq_valor_bebida_inicio
+ uq_valor_id_bebida
+ uq_valor_vigente
+(13 linhas)
+

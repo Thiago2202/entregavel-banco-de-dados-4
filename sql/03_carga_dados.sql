@@ -1,0 +1,129 @@
+-- =========================================================
+-- 03_carga_dados.sql - Massa de dados para testes de performance
+--
+-- Volumes: 400 bebidas | 800 preços | 20.000 clientes | 300.000 pedidos
+-- Sem volume, o PostgreSQL escolheria Seq Scan em qualquer consulta
+-- e o EXPLAIN ANALYZE não diria nada sobre os índices.
+-- Determinístico: setseed() fixa a sequência de random().
+-- =========================================================
+
+SET search_path TO express;
+SELECT setseed(0.42);
+
+-- ---------------------------------------------------------
+-- 400 bebidas
+-- ---------------------------------------------------------
+INSERT INTO table_bebidas (nome, categoria, marca, embalagem, volume_ml, estoque_atual, estoque_minimo)
+SELECT  m.marca || ' ' || s.sabor || ' ' || v.volume || 'ml',
+        c.categoria,
+        m.marca,
+        e.embalagem,
+        v.volume,
+        (random() * 500)::int,
+        20 + (random() * 60)::int
+FROM generate_series(1, 400) AS i
+CROSS JOIN LATERAL (SELECT (ARRAY['Refrigerante','Cerveja','Água','Suco','Energético','Isotônico'])[1 + i % 6] AS categoria) c
+CROSS JOIN LATERAL (SELECT (ARRAY['Aurora','Vale Azul','Serra Alta','Tropical','Estrela','Cascata','Bela Vista','Solaris'])[1 + i % 8] AS marca) m
+CROSS JOIN LATERAL (SELECT (ARRAY['Original','Limão','Laranja','Guaraná','Uva','Zero','Maracujá','Tônica','Cola','Pilsen'])[1 + (i / 3) % 10] AS sabor) s
+CROSS JOIN LATERAL (SELECT (ARRAY['Lata','Garrafa PET','Garrafa de Vidro','Fardo'])[1 + i % 4] AS embalagem) e
+CROSS JOIN LATERAL (SELECT (ARRAY[350, 600, 1000, 2000])[1 + (i / 2) % 4] AS volume) v
+ORDER BY i;
+
+-- ---------------------------------------------------------
+-- Preços: 2 vigências por bebida
+--   antiga: encerrada há 181 dias | atual: em aberto há 180 dias
+-- ---------------------------------------------------------
+INSERT INTO table_valor (id_bebida, preco_custo, preco_venda, data_vigencia_inicio, data_vigencia_fim, ativo)
+SELECT  b.id_bebida,
+        p.custo,
+        round(p.custo * 1.35, 2),
+        CURRENT_DATE - 400,
+        CURRENT_DATE - 181,
+        FALSE
+FROM table_bebidas b
+CROSS JOIN LATERAL (SELECT round((1.5 + random() * 8)::numeric, 2) AS custo) p;
+
+INSERT INTO table_valor (id_bebida, preco_custo, preco_venda, data_vigencia_inicio, data_vigencia_fim, ativo)
+SELECT  v.id_bebida,
+        round(v.preco_custo * 1.06, 2),
+        round(v.preco_venda * 1.08, 2),
+        CURRENT_DATE - 180,
+        NULL,
+        TRUE
+FROM table_valor v;
+
+-- ---------------------------------------------------------
+-- 20.000 clientes (85% PF / 15% PJ), 8 cidades x 25 bairros
+-- ---------------------------------------------------------
+INSERT INTO table_clientes (nome, tipo_pessoa, cpf_cnpj, telefone, email, endereco, numero,
+                            bairro, cidade, estado, cep, ativo, abastecido_mes)
+SELECT  CASE WHEN pj THEN 'Comércio ' ELSE 'Cliente ' END || lpad(i::text, 5, '0'),
+        CASE WHEN pj THEN 'Juridica' ELSE 'Fisica' END,
+        CASE WHEN pj THEN lpad(i::text, 14, '0') ELSE lpad(i::text, 11, '0') END,
+        '11' || lpad((900000000 + (random() * 99999999)::int)::text, 9, '0'),
+        'cliente' || i || '@exemplo.com.br',
+        'Rua ' || (ARRAY['das Flores','do Comércio','XV de Novembro','Sete de Setembro','das Palmeiras'])[1 + i % 5],
+        ((i % 900) + 1)::text,
+        'Bairro ' || lpad((1 + (i * 7) % 25)::text, 2, '0'),
+        cid.cidade,
+        cid.uf,
+        lpad((13000000 + (random() * 999999)::int)::text, 8, '0'),
+        random() < 0.95,
+        random() < 0.40
+FROM generate_series(1, 20000) AS i
+CROSS JOIN LATERAL (SELECT (i % 100) < 15 AS pj) t
+CROSS JOIN LATERAL (
+    SELECT (ARRAY['Campinas','Sorocaba','Santos','Ribeirão Preto','Curitiba','Londrina','Belo Horizonte','Uberlândia'])[1 + i % 8] AS cidade,
+           (ARRAY['SP','SP','SP','SP','PR','PR','MG','MG'])[1 + i % 8] AS uf
+) cid
+ORDER BY i;
+
+-- ---------------------------------------------------------
+-- 300.000 pedidos distribuídos nos últimos 365 dias, em ordem cronológica
+-- (a correlação data x posição física é o que torna o BRIN eficaz).
+-- Pedidos com menos de 3 dias ficam Pendente/Em rota; 3% cancelados.
+-- O preço usado é a vigência que estava ativa na data do pedido.
+-- ---------------------------------------------------------
+INSERT INTO table_comercio (id_cliente, id_bebida, id_valor, quantidade, valor_total,
+                            forma_pagamento, status_entrega, data_pedido, data_entrega)
+SELECT  g.id_cliente, g.id_bebida, v.id_valor, g.qtd, g.qtd * v.preco_venda,
+        g.forma, g.status, g.ts,
+        CASE WHEN g.status = 'Entregue' THEN g.ts + interval '1 day' END
+FROM (
+    SELECT  i,
+            ts,
+            id_cliente, id_bebida, qtd, forma,
+            CASE WHEN r < 0.03                          THEN 'Cancelado'
+                 WHEN ts < now() - interval '3 days'    THEN 'Entregue'
+                 WHEN r < 0.60                          THEN 'Pendente'
+                 ELSE                                        'Em rota' END AS status
+    FROM (
+        SELECT  i,
+                now() - interval '365 days' + i * (interval '365 days' / 300000) AS ts,
+                1 + floor(random() * 20000)::int AS id_cliente,
+                1 + floor(random() * 400)::int   AS id_bebida,
+                1 + floor(random() * 40)::int    AS qtd,
+                (ARRAY['Dinheiro','Pix','Cartao','Boleto'])[1 + floor(random() * 4)::int] AS forma,
+                random() AS r
+        FROM generate_series(1, 300000) AS i
+    ) base
+) g
+JOIN table_valor v
+  ON v.id_bebida = g.id_bebida
+ AND g.ts::date >= v.data_vigencia_inicio
+ AND (v.data_vigencia_fim IS NULL OR g.ts::date <= v.data_vigencia_fim)
+ORDER BY g.i;
+
+-- VACUUM ANALYZE após a carga em massa:
+--   ANALYZE -> estatísticas atualizadas (o planejador só decide bem com elas)
+--   VACUUM  -> marca páginas como visíveis (index-only scans) e RESUME os
+--              blocos novos no índice BRIN, que senão ficam "sem resumo".
+VACUUM (ANALYZE) table_bebidas;
+VACUUM (ANALYZE) table_clientes;
+VACUUM (ANALYZE) table_valor;
+VACUUM (ANALYZE) table_comercio;
+
+SELECT 'table_bebidas'  AS tabela, count(*) AS linhas FROM table_bebidas
+UNION ALL SELECT 'table_valor',    count(*) FROM table_valor
+UNION ALL SELECT 'table_clientes', count(*) FROM table_clientes
+UNION ALL SELECT 'table_comercio', count(*) FROM table_comercio;

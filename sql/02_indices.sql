@@ -1,0 +1,80 @@
+-- =========================================================
+-- 02_indices.sql - Estratégia de indexação
+--
+-- Já existem índices criados automaticamente pelo PostgreSQL
+-- para PRIMARY KEY e UNIQUE (não repetidos aqui):
+--   table_bebidas   : pk (id_bebida)
+--   table_clientes  : pk (id_cliente), uq (cpf_cnpj)
+--   table_valor     : pk (id_valor), uq (id_bebida, data_vigencia_inicio),
+--                     uq (id_valor, id_bebida)
+--   table_comercio  : pk (id_pedido)
+--
+-- Abaixo, só o que as consultas frequentes realmente precisam.
+-- =========================================================
+
+SET search_path TO express;
+
+-- ---------------------------------------------------------
+-- table_valor
+-- ---------------------------------------------------------
+
+-- UNIQUE PARCIAL: cada bebida só pode ter UM preço vigente (em aberto e ativo).
+-- Serve também de índice para a consulta mais comum do sistema:
+--   "qual o preço atual da bebida X?"  (WHERE id_bebida = ? AND ativo AND data_vigencia_fim IS NULL)
+-- É minúsculo: guarda 1 linha por bebida, ignorando todo o histórico.
+CREATE UNIQUE INDEX uq_valor_vigente
+    ON table_valor (id_bebida)
+    WHERE data_vigencia_fim IS NULL AND ativo;
+
+-- ---------------------------------------------------------
+-- table_comercio  (tabela que mais cresce -> índices escolhidos com critério)
+-- ---------------------------------------------------------
+
+-- FK id_cliente + ORDER BY: "últimos pedidos do cliente" (tela de atendimento).
+-- O índice composto devolve as linhas do cliente JÁ ordenadas por data (DESC),
+-- eliminando o passo de Sort. Também acelera o JOIN com table_clientes e a
+-- verificação do ON DELETE RESTRICT.
+CREATE INDEX idx_comercio_cliente_data
+    ON table_comercio (id_cliente, data_pedido DESC);
+
+-- FK id_bebida: relatórios "vendas por bebida" e verificação do
+-- ON DELETE RESTRICT ao tentar excluir uma bebida.
+CREATE INDEX idx_comercio_bebida
+    ON table_comercio (id_bebida);
+
+-- ÍNDICE PARCIAL: fila operacional "entregas em aberto" (roteirização).
+-- Só ~1% dos pedidos está Pendente/Em rota; o restante é histórico.
+-- O índice indexa apenas esse 1% -> pequeno, rápido e barato de manter
+-- (pedidos Entregues/Cancelados não pagam custo de escrita nele).
+CREATE INDEX idx_comercio_em_aberto
+    ON table_comercio (data_pedido)
+    WHERE status_entrega IN ('Pendente', 'Em rota');
+
+-- BRIN: relatórios por período ("vendas dos últimos N dias").
+-- Pedidos são inseridos em ordem cronológica, então data_pedido tem
+-- correlação física quase perfeita com a posição na tabela. Um BRIN guarda
+-- só o min/max por bloco de páginas: fica milhares de vezes menor que um
+-- B-tree e quase não pesa no INSERT.
+CREATE INDEX idx_comercio_data_brin
+    ON table_comercio USING brin (data_pedido);
+
+-- ---------------------------------------------------------
+-- table_clientes
+-- ---------------------------------------------------------
+
+-- ÍNDICE PARCIAL composto: roteirização/prospecção por região
+-- ("clientes ativos de cidade X, bairro Y"). Inativos ficam fora do índice.
+CREATE INDEX idx_clientes_cidade_bairro
+    ON table_clientes (cidade, bairro)
+    WHERE ativo;
+
+-- ---------------------------------------------------------
+-- O que NÃO foi indexado (de propósito)
+-- ---------------------------------------------------------
+--  * table_bebidas (categoria, nome...): catálogo pequeno (centenas de linhas);
+--    o Seq Scan é mais barato que ir ao índice, e o índice só custaria escrita
+--    a cada baixa de estoque (UPDATE). Ver docs/ para a análise.
+--  * table_comercio (id_valor, id_bebida): a FK composta não é usada em JOINs
+--    frequentes, e table_valor raramente sofre DELETE/UPDATE de chave.
+--  * table_comercio (status_entrega) sozinho: só 4 valores distintos (baixa
+--    seletividade). O índice parcial acima cobre o único caso útil.
